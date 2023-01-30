@@ -1,0 +1,379 @@
+---
+title: "Final Project"
+author: "Matthew Sparacio"
+date: "12/8/22"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Load Libraries 
+```{r, warning=FALSE, message=FALSE}
+library(C50)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(kableExtra)
+library(GGally)
+library(kableExtra) # -- make nice looking resutls when we knitt 
+library(vip)        # --  tidymodels variable importance
+library(fastshap)   # -- shapley values for variable importance 
+library(MASS)
+library(rpart.plot) # -- plotting decision trees 
+library(factoextra)
+library(imputeMissings)
+library(ISLR)
+library(tree)
+library(lubridate)
+```
+
+## Load Data and skimming
+```{r, warning=FALSE, message=FALSE}
+donations_clean <- read_csv("DonorMerge_Final.csv") %>% clean_names()
+
+donors_clean <- read_csv("Donations.csv") %>% clean_names()
+
+head(donations_clean)
+skim(donations_clean)
+head(donors_clean)
+skim(donors_clean)
+```
+
+## Dropping Ommited Variables
+From donations, We can remove the identifiers project id, teacher id, both school ids, latitude and longitude, and date posted for the analysis. We can also remove high cardinality variables like school city, district, country, zip code and maybe state (?). We can also remove any variables with a completion % below 80 which includes secondary focus subject, secondary focus area, and great messages proportion.
+
+From donors, for cluster analysis we can remove donation id, project id, donor id, timestamp, and message. we can remove any variables with a completion % below 80 which includes city, state, and zip code. There are also 8 rows with missing data that can be removed. Also adding another category to the donation total variables to make groups more rohbust and account for very high donation total outliers.
+```{r}
+donations <- donations_clean %>%
+  dplyr::select(-projectid, -teacher_acctid, -schoolid, -school_ncesid, -school_latitude, -school_longitude, -date_posted, -school_city, -school_state, -school_district, -school_zip, -school_county, -secondary_focus_subject, -secondary_focus_area, -great_messages_proportion) %>%
+  mutate(is_exciting=ifelse(is_exciting==TRUE,1,0)) %>%
+  mutate(is_exciting=as.factor(is_exciting)) %>%
+  mutate(one_non_teacher_referred_donor_g=as.character(one_non_teacher_referred_donor_g)) %>%
+  mutate(school_charter=as.character(school_charter)) %>%
+  mutate(school_magnet=as.character(school_magnet)) %>%
+  mutate(school_year_round=as.character(school_year_round)) %>%
+  mutate(school_nlns=as.character(school_nlns)) %>%
+  mutate(school_kipp=as.character(school_kipp)) %>%
+  mutate(school_charter_ready_promise=as.character(school_charter_ready_promise)) %>%
+  mutate(teacher_teach_for_america=as.character(teacher_teach_for_america)) %>%
+  mutate(teacher_ny_teaching_fellow=as.character(teacher_ny_teaching_fellow)) %>%
+  mutate(eligible_double_your_impact_matc=as.character(eligible_double_your_impact_matc)) %>%
+  mutate(eligible_almost_home_match=as.character(eligible_almost_home_match)) %>%
+  mutate_if(is.character, factor)
+  
+head(donations)
+
+donors <- donors_clean %>%
+  dplyr::select(-donationid, -projectid, -donor_acctid, -donor_city, -donor_state, -donation_timestamp, -donation_message, -donor_zip) %>%
+  #Taking out only 8 rows with missing data besides already omited variables
+  na.omit()
+
+#Creating new categories to group donation total
+donors$don_under_10 <- ifelse(donors$donation_total<10,1,0)
+donors$don_10_to_100 <- ifelse(donors$donation_total>=10 & donors$donation_total<100,1,0)
+donors$don_100_to_1000 <- ifelse(donors$donation_total>=100 & donors$donation_total<1000,1,0)
+donors$don_over_1000 <- ifelse(donors$donation_total>=1000,1,0)
+
+head(donors)
+skim(donors)
+```
+
+## Exploratory Analysis
+Only around 10% of the projects are actually exciting so need to be careful about overfitting. 
+```{r}
+#Exploring target variable is exciting
+options(scipen=999)
+donations %>%
+  ggplot(aes(x=is_exciting)) +
+  geom_histogram(stat="count") +
+  labs(title = "Is Exciting?")
+
+donations %>%
+  group_by(is_exciting) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = n/sum(n))
+
+
+```
+
+
+## Creating samples to make computations lighter
+```{r}
+set.seed(12)
+donations_sample <- sample_n(donations, size=35000)
+
+#Wanted to do more but everything I tried, was not enough memory
+donors_sample <- sample_n(donors, size=25000)
+```
+
+## Partitioning Classification Data
+```{r}
+# -- set a random seed for repeatablity 
+set.seed(12)
+
+# -- performs our train / test split 
+donations_split <- initial_split(donations, prop = 0.7)
+
+# -- extract the training data 
+donations_train <- training(donations_split)
+# -- extract the test data 
+donations_test <- testing(donations_split)
+
+sprintf("Train PCT : %1.2f%%", nrow(donations_train)/ nrow(donations) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(donations_test)/ nrow(donations) * 100)
+
+head(donations_train)
+```
+
+## Classification Recipe
+Using almost all variables for the first logsitics.
+```{r}
+don_rec <- recipe(is_exciting~.,data=donations_train) %>%
+  step_rm(primary_focus_area, primary_focus_subject) %>%
+  step_impute_median(all_numeric()) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+    prep()
+```
+
+## Bake 
+```{r}
+# -- apply the recipe 
+bake_train <- bake(don_rec, new_data = donations_train)
+bake_test  <- bake(don_rec, new_data = donations_test)
+
+```
+
+## Full Logistic Model
+```{r}
+logistic_glm <-logistic_reg(mode = "classification") %>%
+                  set_engine("glm") %>%
+                  fit(is_exciting ~ ., data = bake_train)
+
+## -- check out your parameter estimates ... 
+tidy(logistic_glm) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4)
+```
+
+
+## Stepwise
+Identifying most significant predictors from the full logstic model using stepwise.
+```{r}
+steplog <- glm(is_exciting ~ ., data = bake_train, family=binomial(link="logit"))
+step <- stepAIC(steplog, direction="both")
+summary(step)
+```
+
+
+## Random Forest Tuning Recipe
+Tuning a random forest using sample data and signficant predictors from stepwise. Trying to identify best parameters to use for random forest with the full data set.
+```{r}
+
+rf_rec_samp <- recipe(is_exciting ~ teacher_referred_count + non_teacher_referred_count + 
+    fulfillment_labor_materials + total_price_excluding_optional_s + 
+    total_price_including_optional_s + students_reached + school_metro + 
+    one_non_teacher_referred_donor_g + school_charter + 
+    school_year_round + school_nlns + school_kipp + 
+    school_charter_ready_promise + teacher_prefix + 
+    teacher_teach_for_america + resource_type + poverty_level + 
+    grade_level + eligible_double_your_impact_matc + 
+    eligible_almost_home_match, data = donations_sample) %>%
+  step_dummy(all_nominal()) %>%
+  step_unknown(all_nominal()) %>%
+  step_impute_median(all_predictors()) %>%
+  prep()
+
+bake_train1 <- bake(rf_rec_samp, new_data = donations_sample) %>% 
+  mutate(is_exciting=as.factor(is_exciting_X1)) %>%
+  dplyr::select(-is_exciting_X1)
+  
+bake_train1
+
+```
+
+```{r}
+rf_mod <-
+  rand_forest(mtry = tune(), trees=tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+
+#set up a resampling strategy
+
+set.seed(1234)
+
+samp_rs <- bootstraps(bake_train1, times=10)
+
+#set up controls
+
+ctrl <- control_grid(verbose = FALSE, save_pred = TRUE)
+
+```
+
+## Execute with a formula
+```{r}
+
+roc_vals <- metric_set(roc_auc)
+
+formula_res <-
+  rf_mod %>%
+  tune_grid(
+    is_exciting ~ .,
+    resamples = samp_rs,
+    grid = 10,
+    metrics = roc_vals,
+    control = ctrl
+  )
+
+
+
+estimates <- collect_metrics(formula_res)
+estimates
+
+show_best(formula_res, metric = "roc_auc")
+```
+
+## Applying best parameters to full data set
+Best parameters from the sample of the data set was mrty of 11 and 600 trees. Applying these parameters to a random forest on the full data set using the same variables.
+```{r}
+rec_rf <- recipe(is_exciting ~ teacher_referred_count + non_teacher_referred_count + 
+    fulfillment_labor_materials + total_price_excluding_optional_s + 
+    total_price_including_optional_s + students_reached + school_metro + 
+    one_non_teacher_referred_donor_g + school_charter + 
+    school_year_round + school_nlns + school_kipp + 
+    school_charter_ready_promise + teacher_prefix + 
+    teacher_teach_for_america + resource_type + poverty_level + 
+    grade_level + eligible_double_your_impact_matc + 
+    eligible_almost_home_match, data = donations_train) %>%
+  step_dummy(all_nominal()) %>%
+  step_unknown(all_nominal()) %>%
+  step_impute_median(all_predictors()) %>%
+  prep()
+
+bake_train_rf <- bake(rec_rf, new_data = donations_train) %>% 
+  mutate(is_exciting=as.factor(is_exciting_X1)) %>% dplyr::select(-is_exciting_X1)
+bake_train_rf
+bake_test_rf <- bake(rec_rf, new_data = donations_test)%>% 
+  mutate(is_exciting=as.factor(is_exciting_X1)) %>% dplyr::select(-is_exciting_X1)
+```
+
+```{r}
+rand1 <- rand_forest(mtry=11, min_n=10, trees=600, mode = "classification") %>%
+                      set_engine("ranger", importance="impurity") %>%
+                      fit(is_exciting ~ ., data = bake_train_rf)
+
+rand1$fit
+
+```
+
+## Scoring Data
+```{r}
+# -- training 
+predict(rand1, bake_train_rf, type = "prob") %>%
+  bind_cols(.,predict(rand1, bake_train_rf)) %>%
+  bind_cols(.,bake_train_rf) -> scored_train_forest
+
+head(scored_train_forest)
+
+# -- testing 
+predict(rand1, bake_test_rf, type = "prob") %>%
+  bind_cols(.,predict(rand1, bake_test_rf)) %>%
+  bind_cols(.,bake_test_rf) -> scored_test_forest
+
+head(scored_test_forest)
+```
+
+## Evaluation
+Model prefomred extremely well. Test AUC of 0.965 is very high and has high precision and recall.
+```{r}
+# -- AUC: Train and Test 
+options(scipen=999)
+scored_train_forest %>% 
+  metrics(is_exciting, .pred_0, estimate = .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_forest %>% 
+               metrics(is_exciting, .pred_0, estimate = .pred_class) %>%
+               mutate(part="testing") 
+  ) 
+  
+#Precision and Recall
+prec_train<-precision_vec(scored_train_forest$is_exciting,scored_train_forest$.pred_class)
+recall_train<-recall_vec(scored_train_forest$is_exciting,scored_train_forest$.pred_class)
+prec_test<-precision_vec(scored_test_forest$is_exciting,scored_test_forest$.pred_class)
+recall_test<-recall_vec(scored_test_forest$is_exciting,scored_test_forest$.pred_class)
+
+sprintf("Train Precision: %1.4f%%", prec_train)
+sprintf("Train Recall: %1.4f%%", recall_train)
+sprintf("Test Precision: %1.4f%%", prec_test)
+sprintf("Test Recall: %1.4f%%", recall_test)
+
+# -- Variable Importance top 10 features  
+rand1 %>%
+  vip(num_features = 10)
+
+# -- ROC Charts 
+scored_train_forest %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test_forest %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(is_exciting, .pred_0) %>%
+  autoplot()
+
+
+# -- Confustion Matricies  
+scored_train_forest %>%
+  conf_mat(is_exciting, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_forest %>%
+  conf_mat(is_exciting, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+```
+
+
+
+
+
+
+## Clustering Sizes
+Figuring out how many clusters to use on the sample data set. Using the elbow method, can identify that we should use 4 clusters.
+```{r}
+cluster_rec <- recipe(~.,data=donors_sample) %>%
+  step_rm(donation_to_project, donation_optional_support, donation_total, dollar_amount) %>%
+  step_impute_median(all_numeric()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal()) %>%
+  prep()
+
+bake_cluster <- bake(cluster_rec, new_data = donors_sample)
+
+
+fviz_nbclust(bake_cluster, kmeans, method="wss")
+```
+
+## Clustering
+Based on the cluster size calculated from the sample data set, clustering the full data set using 4 clusters.
+```{r}
+cluster_rec1 <- recipe(~.,data=donors) %>%
+  step_rm(donation_to_project, donation_optional_support, dollar_amount, donation_total) %>%
+  step_impute_median(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal()) %>%
+  prep()
+
+bake_cluster1 <- bake(cluster_rec1, new_data = donors)
+
+set.seed(12)
+clusters <- kmeans(bake_cluster1, 4, iter.max = 200, nstart = 10)
+print(clusters)
+```
+
